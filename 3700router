@@ -1,0 +1,396 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math
+
+
+# input: a decimal integer
+# output: a list of 1s and 0s representing an 8-bit binary number
+# NOTE: only works for 8 bits right now
+def dec_to_bin(num):  # must give it an int!!
+    bit_vals = [128, 64, 32, 16, 8, 4, 2, 1]
+    counter = 0
+    return_val = [0, 0, 0, 0, 0, 0, 0, 0]
+    while num > 0:
+        bit_to_add = bit_vals[counter]
+        if counter == len(bit_vals):
+            break
+        if bit_to_add <= num:
+            num -= bit_to_add
+            return_val[counter] = 1
+            counter += 1
+        else:
+            counter += 1
+    return return_val
+
+
+# input: a list of 1s and 0s
+# output: a decimal integer
+def bin_to_dec(binary_num):
+    multiplier = 1
+    return_val = 0
+    for bit in reversed(binary_num):
+        return_val += bit * multiplier
+        multiplier *= 2
+    return return_val
+
+
+# converts a string IP address into a list of bits
+# if flag is 0 return a list if flag is 1 return an int
+def string_ip_to_binary(string_ip, flag=0):
+    split = string_ip.split('.')
+    four_quads = [int(split[0]), int(split[1]), int(split[2]), int(split[3])]
+    binary_rep = []
+    if flag == 0:
+        for quad in four_quads:
+            binary_rep += dec_to_bin(quad)
+        return binary_rep
+    else:
+        rv = ""
+        for quad in split:
+            rv += quad
+        return int(rv)
+
+
+# converts a list of bits into a string IP address
+# NOTE: if the list of bits is less than 32 characters, it just assumes the rest are 0s
+def bits_to_string_ip(bits):
+    quad1 = []
+    quad2 = []
+    quad3 = []
+    quad4 = []
+    for i in range(0, 31):
+        if i < 8:
+            quad1.append(bits[i]) if i < len(bits) else quad1.append(0)
+        elif i < 16:
+            quad2.append(bits[i]) if i < len(bits) else quad2.append(0)
+        elif i < 24:
+            quad3.append(bits[i]) if i < len(bits) else quad3.append(0)
+        elif i < 32:
+            quad4.append(bits[i]) if i < len(bits) else quad4.append(0)
+    return str(bin_to_dec(quad1)) + "." + str(bin_to_dec(quad2)) + "." + str(bin_to_dec(quad3)) + "." + str(
+        bin_to_dec(quad4))
+
+
+# Is dst within the range of ip addresses given by min_ip, max_ip?
+# converts all of them to integers, then simply uses <=
+def within_range(dst, min_ip, max_ip):
+    min_as_int = bin_to_dec(string_ip_to_binary(min_ip))
+    max_as_int = bin_to_dec(string_ip_to_binary(max_ip))
+    dst_ip_as_int = bin_to_dec(string_ip_to_binary(dst))
+    return min_as_int <= dst_ip_as_int <= max_as_int
+
+
+# input: an integer, like 24
+# output: a string representation of a netmask, like "255.255.255.0"
+def mask_length_to_string(length):
+    bits = []
+    for i in range(0, length):
+        bits.append(1)
+    return bits_to_string_ip(bits)
+
+
+# masks an IP to get the range of possible IP addresses in CIDR representation
+# network is the binary representation of the IP address, netmask mask length is a decimal int
+# returns an array with the minimum ip address and the maximum ip address, both as string representations
+def get_range(network, netmask):
+    network_as_binary = string_ip_to_binary(network, 0)
+    mask_as_binary = string_ip_to_binary(netmask, 0)
+    mask_length = 0
+    for bit in mask_as_binary:
+        if bit == 1:
+            mask_length += 1
+        else:
+            break
+    fixed_bits = []
+    for i in range(0, mask_length):
+        fixed_bits.append(network_as_binary[i])
+    min_of_range = bits_to_string_ip(fixed_bits)
+    max_ip_as_binary = fixed_bits
+    for i in range(0, 32 - len(fixed_bits)):  # since the unspecified bits are like wildcards, if you make them
+        # all 1s you get the highest possible ip address given this network / netmask
+        max_ip_as_binary.append(1)
+    max_of_range = bits_to_string_ip(max_ip_as_binary)
+    return [min_of_range, max_of_range]
+
+
+# input: a string like "255.255.0.0"
+# output: length of that netmask (16)
+def get_mask_length(netmask_as_string):
+    count = 0
+    for bit in string_ip_to_binary(netmask_as_string):
+        if bit == 1:
+            count += 1
+        else:
+            break
+    return count
+
+
+# returns whether two table entries have the same: next-hop router, localpref, selfOrigin, ASPath, and origin
+def same_attributes(first, second):
+    same_next_hop = first['peer'] == second['peer']
+    same_localpref = first['localpref'] == second['localpref']
+    same_selfOrigin = first['selfOrigin'] == second['selfOrigin']
+    same_asPath = first['ASPath'] == second['ASPath']
+    same_origin = first['origin'] == second['origin']
+    return same_next_hop and same_localpref and same_selfOrigin and same_asPath and same_origin
+
+
+# in order to be numerically adjacent, the first (last-1) bits must be the same, and the last bit must be different
+def numerically_adjacent(first, second):
+    if len(first) == 0 or len(second) == 0:
+        return False
+    same_up_to_last_bit = (first[:-1] == second[:-1])
+    last_bit_different = (first[-1] != second[-1])
+    return same_up_to_last_bit and last_bit_different
+
+
+class Router:
+    relations = {}
+    sockets = {}
+    ports = {}
+
+    # routing table is a list of: {network, netmask, peer, localpref, ASPath, selfOrigin, origin}
+    table = []
+
+    # has the update and withdraw messages stored for when we need to disaggregate
+    backup_table = []
+
+    def __init__(self, asn, connections):
+        self.asn = asn
+        for relationship in connections:
+            port, neighbor, relation = relationship.split("-")
+
+            self.sockets[neighbor] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sockets[neighbor].bind(('localhost', 0))
+            self.ports[neighbor] = int(port)
+            self.relations[neighbor] = relation
+            self.send(neighbor,
+                      json.dumps({"type": "handshake", "src": self.our_addr(neighbor), "dst": neighbor, "msg": {}}))
+
+    def our_addr(self, dst):
+        quads = list(int(qdn) for qdn in dst.split('.'))
+        quads[3] = 1
+        return "%d.%d.%d.%d" % (quads[0], quads[1], quads[2], quads[3])
+
+    def send(self, network, message):
+        self.sockets[network].sendto(message.encode('utf-8'), ('localhost', self.ports[network]))
+
+    # Given a destination ip, determine which entry in the routing table it should go to
+    # if there are no matching entries, return "no route"
+    def best_dest_match(self, dst_ip):
+        tie = False  # have we found a singular best match? Will be FALSE if there's a tie
+        all_matching = []  # every entry in self.table that matches the destination
+        best_match = None  # the best match so far, will be updated throughout
+
+        # build the list of all entries that match dst_ip
+        for entry in self.table:
+            min_ip, max_ip = get_range(entry['network'],
+                                       entry['netmask'])
+            if within_range(dst_ip, min_ip, max_ip):
+                all_matching.append(entry)
+        if len(all_matching) == 0:  # if there are no matching entries, there's no possible route
+            return 'no route'
+        elif len(all_matching) == 1:  # if there's exactly one match, no need to use tiebreakers
+            return all_matching[0]
+        else:
+            best_match = all_matching[0]
+            # a list of all matching mask lengths: the first step in breaking the tie
+            matching_mask_lengths = [get_mask_length(entry['netmask']) for entry in all_matching]
+            # If there's only one max, that's our best match. Otherwise, continue tiebreaking
+            if matching_mask_lengths.count(max(matching_mask_lengths)) == 1:
+                return all_matching[matching_mask_lengths.index(max(matching_mask_lengths))]
+            else:
+                # the max of all matching localprefs: if there are multiple, continue the tiebreaking
+                max_lp = max([entry['localpref'] for entry in all_matching])
+                lp_list = [entry['localpref'] for entry in all_matching]  # list of all localprefs
+                if lp_list.count(max_lp) == 1:
+                    return all_matching[lp_list.index(max_lp)]
+                else:
+                    # if there's only one True, then that's best match, else, continue tiebreaking
+                    so_list = [entry['selfOrigin'] for entry in all_matching]  # list of all selfOrigins
+                    if so_list.count(True) == 1:
+                        return all_matching[so_list.index(True)]
+                    else:
+                        max_asp = min([len(entry['ASPath']) for entry in all_matching])
+                        asp_list = [len(entry['ASPath']) for entry in all_matching]  # list of all ASPath lengths
+                        if asp_list.count(max_asp) == 1:
+                            return all_matching[asp_list.index(max_asp)]
+                        else:
+                            # best_match = all_matching[0]  # might fix a bug, not sure
+                            ogn_list = []
+                            for entry in all_matching:  # make a list of all origin types (mapped to ints)
+                                if entry['origin'] == 'UNK': ogn_list.append(3)
+                                if entry['origin'] == 'EGP': ogn_list.append(2)
+                                if entry['origin'] == 'IGP': ogn_list.append(1)  # IGP is the highest preference
+                            if ogn_list.count(min(ogn_list)) == 1:
+                                return all_matching[ogn_list[ogn_list.index(min(ogn_list))]]
+                            else:  # list of the IP addresses as integer values
+                                ip_value_list = [string_ip_to_binary(entry['peer'], 1) for entry in all_matching]
+                                return all_matching[ip_value_list.index(min(ip_value_list))]
+        return best_match
+
+    # If the source router or destination router is a customer, then your router should forward the data.
+    # If the source router is a peer or a provider and the destination is a peer or a provider,
+    # then drop the data message.
+    def send_data(self, message, srcif):
+        src = message['src']
+        dst = message['dst']
+        msg = message['msg']
+        message_dict = {"src": src, "dst": dst, "type": "data", "msg": msg}
+        # if there's no route, send a no route message back to the router from which you received this data message
+        if self.best_dest_match(message['dst']) == "no route":
+            message_dict = {"src": srcif[:-1] + "1", "dst": src, "type": "no route", "msg": {}}
+            self.send(srcif, json.dumps(message_dict))
+        else:
+            next_router = self.best_dest_match(message['dst'])['peer']  # this is the router we're going to send this
+            # data message to, not the final destination of the message (which will be a host)
+            if self.relations[next_router] == 'cust' or self.relations[srcif] == "cust":
+                self.send(next_router, json.dumps(message_dict))
+
+    # new is the 'msg' field of a newly received update message
+    # existing is the index of self.table that we're comparing to new (to see if they can be aggregated)
+    def aggregate(self, new, existing_index):
+        did_aggregate = False
+        if len(self.table) == 0:
+            self.table.append(new)
+            return
+        elif existing_index < len(self.table):
+            existing = self.table[existing_index]  # the existing entry in self.table corresponding to the given index
+            new_prefix = string_ip_to_binary(new['network'])
+            new_mask_len = get_mask_length(new['netmask'])
+            existing_prefix = string_ip_to_binary(existing['network'])
+            existing_mask_len = get_mask_length(existing['netmask'])
+            # if we can aggregate new and existing
+            if numerically_adjacent(existing_prefix[:existing_mask_len], new_prefix[:new_mask_len]) \
+                    and same_attributes(new, existing):
+                new_prefix[new_mask_len - 1] = 0
+                new['network'] = bits_to_string_ip(new_prefix)
+                new['netmask'] = mask_length_to_string(new_mask_len - 1)
+                self.table.pop(existing_index)
+                did_aggregate = True
+
+            # RECURSE HERE whether or not we can aggregate
+            if did_aggregate:
+                self.aggregate(new.copy(), 0)
+            else:
+                self.aggregate(new, existing_index + 1)
+        elif existing_index >= len(self.table):  # we're done recurring
+            self.table.append(new)
+
+    # parses an update message to turn it into a valid routing table entry, then sends an update message to all
+    # neighbors (except the one that sent us this update message)
+    # if this is being called from disaggregate(), DON'T send any update messages
+    def parse_update(self, json_message, disaggregate=False):
+        decoded = json_message.copy()
+        network = decoded['msg']['network']
+        netmask = decoded['msg']['netmask']
+        src = decoded['src']
+        as_path = [args.asn]
+        for i in decoded['msg']['ASPath']:
+            as_path.append(i)
+        # the message to be added is just the old one, but we add a 'peer' field
+        # peer = source IP of the router that sent the corresponding update message
+        new_entry = decoded['msg']
+        new_entry['peer'] = src
+        self.aggregate(new_entry.copy(), 0)  # aggregate every time there's a new route
+
+        message_dict = {"msg": {"netmask": netmask, "ASPath": as_path, "network": network},
+                        "src": "placeholder", "dst": "placeholder", "type": "update"}
+        if not disaggregate:
+            self.forward_message(message_dict, src)
+
+    # forwards a given message to all sockets besides the given src
+    def forward_message(self, message, src):
+        flag = 0 if self.relations[src] == 'cust' else 1
+        for sock in self.sockets:
+            if sock != src and (flag == 0 or (flag == 1 and self.relations[sock] == 'cust')):
+                message['src'] = str(sock)[:-1] + '1'
+                message['dst'] = str(sock)
+                self.send(sock, json.dumps(message))
+
+    # ends a dump message (sends all the cached route announcements)
+    def dump(self, json_message):
+        decoded = json_message.copy()
+        dst = decoded['src']
+        src = decoded['dst']
+        msg_dict = {"src": src, "dst": dst, "type": "table", "msg": self.table}
+        self.send(dst, json.dumps(msg_dict))
+
+    # withdraws a message from our routing table (calls disaggregate)
+    def withdraw(self, json_message):
+        print('TABLE')
+        for x in self.table:
+            print(x)
+        decoded = json_message.copy()
+        src = decoded['src']
+        dst = decoded['dst']
+        if dst != 0:  # if this is the destined router (0 is placeholder)
+            for withdrawn in decoded['msg']:
+                for entry in self.table:
+                    # make sure the peer IP matches the source IP of the message
+                    if entry['network'] == withdrawn['network'] and entry['peer'] == src and \
+                            entry['netmask'] == withdrawn['netmask']:
+                        #print("Removing %s / %s (peer: %s)" % (entry['network'], entry['netmask'], entry['peer']))
+                        print("Removing %s" % entry)
+                        print("src: %s" % src)
+                        self.table.remove(entry)
+
+            self.forward_message(json_message.copy(), src)
+        self.disaggregate(json_message.copy())
+        print('TABLE AGAIN')
+        for x in self.table:
+            print(x)
+
+    # remove this (withdraw) message from self.backup_table, then wipe self.table, then rebuild self.table
+    # using self.backup_table (aggregating every time we add a new entry to self.table)
+    def disaggregate(self, message):
+        print("DISAGGREGATING")
+        print(message)
+        self.table = []
+
+        # scan the backup table for update messages that will be nullified by this withdraw message
+        # a withdraw message might have multiple paths in its list so we're looping through those too
+        for withdrawn in message['msg']:
+            for entry in self.backup_table:
+                # make sure peer IP matches source IP of the withdraw message
+                print(entry['msg']['peer'])
+                #print("Do %s and %s match?" % (entry['msg']['peer'], test))
+                if entry['msg']['network'] == withdrawn['network'] \
+                        and entry['msg']['netmask'] == withdrawn['netmask'] and entry['msg']['peer'] == message['src']:
+
+                    self.backup_table.remove(entry)
+        for backup in self.backup_table:
+            self.parse_update(backup, disaggregate=True)
+
+    def run(self):
+        while True:
+            socks = select.select(self.sockets.values(), [], [], 0.1)[0]
+            for conn in socks:
+                k, addr = conn.recvfrom(65535)  # addr is always 127.0.0.1 + the port I'm pretty sure
+                srcif = None
+                for sock in self.sockets:
+                    if self.sockets[sock] == conn:
+                        srcif = sock
+                        break
+                msg = k.decode('utf-8')
+
+                msg_to_parse = json.loads(k)
+                if msg_to_parse['type'] == 'update':
+                    self.backup_table.append(msg_to_parse)  # keep this order
+                    self.parse_update(msg_to_parse)
+                if msg_to_parse['type'] == 'dump':
+                    self.dump(msg_to_parse)
+                if msg_to_parse['type'] == 'data':
+                    self.send_data(msg_to_parse, srcif)  # passing in srcif here for the src if there's no route
+                if msg_to_parse['type'] == 'withdraw':
+                    self.withdraw(msg_to_parse)
+        return
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='route packets')
+    parser.add_argument('asn', type=int, help="AS number of this router")
+    parser.add_argument('connections', metavar='connections', type=str, nargs='+', help="connections")
+    args = parser.parse_args()
+    router = Router(args.asn, args.connections)
+    router.run()
